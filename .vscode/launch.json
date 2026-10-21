@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mac-wiimote}",
+            "name": "Debug MacWiimote",
+            "target": "MacWiimote",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug MacWiimote"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mac-wiimote}",
+            "name": "Release MacWiimote",
+            "target": "MacWiimote",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release MacWiimote"
+        }
+    ]
+}
