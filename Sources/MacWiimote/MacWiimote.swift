@@ -8,12 +8,18 @@ nonisolated(unsafe) private var physicalWiimoteDevice: IOHIDDevice?
 nonisolated(unsafe) private var currentLEDMask: UInt8 = 0x10 // LED 1
 nonisolated(unsafe) private var virtualDevice: HIDVirtualDevice?
 
-// Gyro calibration
+// Gyro & Accelerometer calibration
 nonisolated(unsafe) private var isCalibrated = false
 nonisolated(unsafe) private var calibrationSamples = 0
-nonisolated(unsafe) private var biasPitch: Double = 8192
-nonisolated(unsafe) private var biasRoll: Double = 8192
-nonisolated(unsafe) private var biasYaw: Double = 8192
+nonisolated(unsafe) private var biasPitch: Double = 8192.0
+nonisolated(unsafe) private var biasRoll: Double = 8192.0
+nonisolated(unsafe) private var biasYaw: Double = 8192.0
+
+// Accelerometer resting calibration (face-up on table)
+nonisolated(unsafe) private var biasAccelX: Double = 512.0
+nonisolated(unsafe) private var biasAccelY: Double = 512.0
+nonisolated(unsafe) private var restingAccelZ: Double = 616.0
+nonisolated(unsafe) private var scale1G: Double = 104.0
 
 nonisolated(unsafe) private var packetCount = 0
 
@@ -32,11 +38,13 @@ func setPhysicalWiimoteRumble(on: Bool) {
 
 final class VirtualGamepadDelegate: HIDVirtualDeviceDelegate, @unchecked Sendable {
     func hidVirtualDevice(_ device: HIDVirtualDevice, receivedSetReportRequestOfType type: HIDReportType, id: HIDReportID?, data: Data) async throws {
-        if let firstByte = data.first, firstByte > 0 {
-            setPhysicalWiimoteRumble(on: true)
-        } else {
-            setPhysicalWiimoteRumble(on: false)
-        }
+        let rumbleValue: UInt8 = {
+            if data.count >= 2 && data[0] == 1 {
+                return data[1]
+            }
+            return data.first ?? 0
+        }()
+        setPhysicalWiimoteRumble(on: rumbleValue > 0)
     }
     
     func hidVirtualDevice(_ device: HIDVirtualDevice, receivedGetReportRequestOfType type: HIDReportType, id: HIDReportID?, maxSize: Int) async throws -> Data {
@@ -53,28 +61,34 @@ func wiimoteInputCallback(context: UnsafeMutableRawPointer?, result: IOReturn, s
     packetCount += 1
     
     if id == 0x35 && data.count >= 22 {
-        // Parse Digital Buttons
-        let btnRaw = UInt16(data[1]) | (UInt16(data[2]) << 8)
-        var buttons: UInt16 = 0
-        if (btnRaw & 0x0008) != 0 { buttons |= (1 << 0) } // Btn 1: A
-        if (btnRaw & 0x0004) != 0 { buttons |= (1 << 1) } // Btn 2: B
-        if (btnRaw & 0x0002) != 0 { buttons |= (1 << 2) } // Btn 3: 1
-        if (btnRaw & 0x0001) != 0 { buttons |= (1 << 3) } // Btn 4: 2
-        if (btnRaw & 0x0010) != 0 { buttons |= (1 << 4) } // Btn 5: Minus
-        if (btnRaw & 0x1000) != 0 { buttons |= (1 << 5) } // Btn 6: Plus
-        if (btnRaw & 0x0080) != 0 { buttons |= (1 << 6) } // Btn 7: Home
-        if (btnRaw & 0x0800) != 0 { buttons |= (1 << 7) } // Btn 8: D-Pad Up
-        if (btnRaw & 0x0400) != 0 { buttons |= (1 << 8) } // Btn 9: D-Pad Down
-        if (btnRaw & 0x0100) != 0 { buttons |= (1 << 9) } // Btn 10: D-Pad Left
-        if (btnRaw & 0x0200) != 0 { buttons |= (1 << 10) }// Btn 11: D-Pad Right
+        let b1 = data[1]
+        let b2 = data[2]
         
-        // Accelerometer (10-bit raw centered ~128)
-        let rawX = Int16(data[3]) - 128
-        let rawY = Int16(data[4]) - 128
-        let rawZ = Int16(data[5]) - 128
-        let accelX = rawX * 256
-        let accelY = rawY * 256
-        let accelZ = rawZ * 256
+        // Parse Digital Buttons
+        var buttons: UInt16 = 0
+        if (b2 & 0x08) != 0 { buttons |= (1 << 0) } // Btn 1: A
+        if (b2 & 0x04) != 0 { buttons |= (1 << 1) } // Btn 2: B
+        if (b2 & 0x02) != 0 { buttons |= (1 << 2) } // Btn 3: 1
+        if (b2 & 0x01) != 0 { buttons |= (1 << 3) } // Btn 4: 2
+        if (b2 & 0x10) != 0 { buttons |= (1 << 4) } // Btn 5: Minus
+        if (b1 & 0x10) != 0 { buttons |= (1 << 5) } // Btn 6: Plus
+        if (b2 & 0x80) != 0 { buttons |= (1 << 6) } // Btn 7: Home
+        if (b1 & 0x08) != 0 { buttons |= (1 << 7) } // Btn 8: D-Pad Up
+        if (b1 & 0x04) != 0 { buttons |= (1 << 8) } // Btn 9: D-Pad Down
+        if (b1 & 0x01) != 0 { buttons |= (1 << 9) } // Btn 10: D-Pad Left
+        if (b1 & 0x02) != 0 { buttons |= (1 << 10) }// Btn 11: D-Pad Right
+        
+        // Re-calibrate zero pose if Home button is pressed while already calibrated
+        if (b2 & 0x80) != 0 && isCalibrated {
+            print("[*] Home button pressed -> Re-calibrating zero pose (keep Wiimote still on desk)...")
+            isCalibrated = false
+            calibrationSamples = 0
+        }
+        
+        // Accelerometer 10-bit reconstruction (0..1023, center ~512)
+        let rawX10 = (Int(data[3]) << 2) | ((Int(b1) >> 5) & 0x03)
+        let rawY10 = (Int(data[4]) << 2) | ((Int(b2) >> 4) & 0x02)
+        let rawZ10 = (Int(data[5]) << 2) | ((Int(b2) >> 5) & 0x02)
         
         // MotionPlus Gyro (14-bit angular rates)
         let yawLow = Int(data[6])
@@ -88,25 +102,51 @@ func wiimoteInputCallback(context: UnsafeMutableRawPointer?, result: IOReturn, s
         let rawRoll = Double((rollHigh << 8) | rollLow)
         let rawPitch = Double((pitchHigh << 8) | pitchLow)
         
-        // Calibration for first 40 frames while resting
+        // Calibration for first 60 frames while resting flat, buttons up
         if !isCalibrated {
             calibrationSamples += 1
-            biasPitch = (biasPitch * 0.9) + (rawPitch * 0.1)
-            biasRoll  = (biasRoll  * 0.9) + (rawRoll  * 0.1)
-            biasYaw   = (biasYaw   * 0.9) + (rawYaw   * 0.1)
-            if calibrationSamples > 40 {
+            if calibrationSamples == 1 {
+                biasPitch = rawPitch
+                biasRoll  = rawRoll
+                biasYaw   = rawYaw
+                biasAccelX = Double(rawX10)
+                biasAccelY = Double(rawY10)
+                restingAccelZ = Double(rawZ10)
+            } else {
+                biasPitch += (rawPitch - biasPitch) * 0.08
+                biasRoll  += (rawRoll  - biasRoll)  * 0.08
+                biasYaw   += (rawYaw   - biasYaw)   * 0.08
+                biasAccelX += (Double(rawX10) - biasAccelX) * 0.08
+                biasAccelY += (Double(rawY10) - biasAccelY) * 0.08
+                restingAccelZ += (Double(rawZ10) - restingAccelZ) * 0.08
+            }
+            
+            if calibrationSamples >= 60 {
                 isCalibrated = true
-                print("[+] MotionPlus gyro zero-calibration complete!")
+                // 1G is difference between resting Z (+1G) and ~512 (0G)
+                scale1G = max(restingAccelZ - 512.0, 80.0)
+                print(String(format: "[+] Calibration complete! Resting pose locked."))
+                print(String(format: "    Accel zero bias: X=%.1f, Y=%.1f | Resting Z (+1G): %.1f | Scale1G: %.1f counts/G", biasAccelX, biasAccelY, restingAccelZ, scale1G))
+                print(String(format: "    Gyro zero bias: Pitch=%.1f, Roll=%.1f, Yaw=%.1f", biasPitch, biasRoll, biasYaw))
+                print("[*] Tip: You can press the 'Home' button anytime while resting flat to re-zero!")
             }
         }
         
-        // Relative angular velocities scaled to signed 16-bit
-        let gyroPitch = Int16(clamping: Int((rawPitch - biasPitch) * 16))
-        let gyroRoll  = Int16(clamping: Int((rawRoll  - biasRoll)  * 16))
-        let gyroYaw   = Int16(clamping: Int((rawYaw   - biasYaw)   * 16))
+        // Scaled Accelerometer (-32768 to 32767, resting on desk = 0 on all axes, +/- 1G = full deflection)
+        let diffX = Double(rawX10) - biasAccelX
+        let diffY = Double(rawY10) - biasAccelY
+        let diffZ = Double(rawZ10) - restingAccelZ
+        let accelX = Int16(clamping: Int((diffX / scale1G) * 32767.0))
+        let accelY = Int16(clamping: Int((diffY / scale1G) * 32767.0))
+        let accelZ = Int16(clamping: Int((diffZ / scale1G) * 32767.0))
         
-        // Assemble Virtual USB Gamepad report
-        var virtualReport = Data([0x01]) // Report ID 1
+        // Scaled Gyroscope (angular velocities)
+        let gyroPitch = Int16(clamping: Int((rawPitch - biasPitch) * 24.0))
+        let gyroRoll  = Int16(clamping: Int((rawRoll  - biasRoll)  * 24.0))
+        let gyroYaw   = Int16(clamping: Int((rawYaw   - biasYaw)   * 24.0))
+        
+        // Assemble Virtual USB Gamepad report (Report ID 1, 15 bytes total)
+        var virtualReport = Data([0x01])
         withUnsafeBytes(of: buttons.littleEndian) { virtualReport.append(contentsOf: $0) }
         withUnsafeBytes(of: accelX.littleEndian) { virtualReport.append(contentsOf: $0) }
         withUnsafeBytes(of: accelY.littleEndian) { virtualReport.append(contentsOf: $0) }
@@ -123,19 +163,21 @@ func wiimoteInputCallback(context: UnsafeMutableRawPointer?, result: IOReturn, s
         
         if packetCount % 50 == 0 || buttons != 0 {
             var pressed = [String]()
-            if (btnRaw & 0x0008) != 0 { pressed.append("A") }
-            if (btnRaw & 0x0004) != 0 { pressed.append("B") }
-            if (btnRaw & 0x0002) != 0 { pressed.append("1") }
-            if (btnRaw & 0x0001) != 0 { pressed.append("2") }
-            if (btnRaw & 0x0010) != 0 { pressed.append("-") }
-            if (btnRaw & 0x1000) != 0 { pressed.append("+") }
-            if (btnRaw & 0x0080) != 0 { pressed.append("Home") }
-            if (btnRaw & 0x0800) != 0 { pressed.append("Up") }
-            if (btnRaw & 0x0400) != 0 { pressed.append("Down") }
-            if (btnRaw & 0x0100) != 0 { pressed.append("Left") }
-            if (btnRaw & 0x0200) != 0 { pressed.append("Right") }
+            if (b2 & 0x08) != 0 { pressed.append("A") }
+            if (b2 & 0x04) != 0 { pressed.append("B") }
+            if (b2 & 0x02) != 0 { pressed.append("1") }
+            if (b2 & 0x01) != 0 { pressed.append("2") }
+            if (b2 & 0x10) != 0 { pressed.append("-") }
+            if (b1 & 0x10) != 0 { pressed.append("+") }
+            if (b2 & 0x80) != 0 { pressed.append("Home") }
+            if (b1 & 0x08) != 0 { pressed.append("Up") }
+            if (b1 & 0x04) != 0 { pressed.append("Down") }
+            if (b1 & 0x01) != 0 { pressed.append("Left") }
+            if (b1 & 0x02) != 0 { pressed.append("Right") }
             let btnStr = pressed.isEmpty ? "[None]" : pressed.joined(separator: "+")
-            print("🎮 Telemetry | Buttons: \(btnStr.padding(toLength: 12, withPad: " ", startingAt: 0)) | AccelX: \(accelX) | GyroYaw: \(gyroYaw)")
+            print(String(format: "🎮 Telemetry | Buttons: %@ | Accel: X=%6d Y=%6d Z=%6d | Gyro: P=%6d R=%6d Y=%6d",
+                         btnStr.padding(toLength: 10, withPad: " ", startingAt: 0),
+                         accelX, accelY, accelZ, gyroPitch, gyroRoll, gyroYaw))
         }
     }
 }
