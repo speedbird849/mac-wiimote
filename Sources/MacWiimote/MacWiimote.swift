@@ -3,17 +3,19 @@ import CoreHID
 import IOKit
 import IOKit.hid
 
-// Global reference for rumble callback to reach physical Wiimote
+// Global references
 nonisolated(unsafe) private var physicalWiimoteDevice: IOHIDDevice?
 nonisolated(unsafe) private var currentLEDMask: UInt8 = 0x10 // LED 1
 nonisolated(unsafe) private var virtualDevice: HIDVirtualDevice?
 
-// Gyro zero-bias calibration
+// Gyro calibration
 nonisolated(unsafe) private var isCalibrated = false
 nonisolated(unsafe) private var calibrationSamples = 0
 nonisolated(unsafe) private var biasPitch: Double = 8192
 nonisolated(unsafe) private var biasRoll: Double = 8192
 nonisolated(unsafe) private var biasYaw: Double = 8192
+
+nonisolated(unsafe) private var packetCount = 0
 
 func sendWiimoteReport(data: [UInt8]) {
     guard let dev = physicalWiimoteDevice else { return }
@@ -47,6 +49,8 @@ func wiimoteInputCallback(context: UnsafeMutableRawPointer?, result: IOReturn, s
     guard reportLength > 0 else { return }
     let data = Data(bytes: report, count: reportLength)
     let id = data[0]
+    
+    packetCount += 1
     
     if id == 0x35 && data.count >= 22 {
         // Parse Digital Buttons
@@ -92,7 +96,7 @@ func wiimoteInputCallback(context: UnsafeMutableRawPointer?, result: IOReturn, s
             biasYaw   = (biasYaw   * 0.9) + (rawYaw   * 0.1)
             if calibrationSamples > 40 {
                 isCalibrated = true
-                print("[+] MotionPlus zero-calibration complete!")
+                print("[+] MotionPlus gyro zero-calibration complete!")
             }
         }
         
@@ -116,42 +120,55 @@ func wiimoteInputCallback(context: UnsafeMutableRawPointer?, result: IOReturn, s
                 try? await dev.dispatchInputReport(data: virtualReport, timestamp: .now)
             }
         }
+        
+        if packetCount % 50 == 0 || buttons != 0 {
+            var pressed = [String]()
+            if (btnRaw & 0x0008) != 0 { pressed.append("A") }
+            if (btnRaw & 0x0004) != 0 { pressed.append("B") }
+            if (btnRaw & 0x0002) != 0 { pressed.append("1") }
+            if (btnRaw & 0x0001) != 0 { pressed.append("2") }
+            if (btnRaw & 0x0010) != 0 { pressed.append("-") }
+            if (btnRaw & 0x1000) != 0 { pressed.append("+") }
+            if (btnRaw & 0x0080) != 0 { pressed.append("Home") }
+            if (btnRaw & 0x0800) != 0 { pressed.append("Up") }
+            if (btnRaw & 0x0400) != 0 { pressed.append("Down") }
+            if (btnRaw & 0x0100) != 0 { pressed.append("Left") }
+            if (btnRaw & 0x0200) != 0 { pressed.append("Right") }
+            let btnStr = pressed.isEmpty ? "[None]" : pressed.joined(separator: "+")
+            print("🎮 Telemetry | Buttons: \(btnStr.padding(toLength: 12, withPad: " ", startingAt: 0)) | AccelX: \(accelX) | GyroYaw: \(gyroYaw)")
+        }
     }
 }
 
 func startWiimoteInitialization(device: IOHIDDevice) {
     Task {
-        // 1. Initial Rumble Buzz (0.2s) + LED 1
-        print("[*] Testing vibration motor & lighting LED 1...")
-        sendWiimoteReport(data: [0x11, 0x11]) // Rumble ON
-        try? await Task.sleep(nanoseconds: 200_000_000)
-        
-        sendWiimoteReport(data: [0x11, 0x10]) // Rumble OFF
-        print("[+] Motor buzz verified! LED 1 solid.")
+        // Immediately set Player 1 LED to SOLID (0x10) and ensure rumble is strictly OFF (0x00)
+        print("[*] Setting Player 1 LED and silencing rumble...")
+        sendWiimoteReport(data: [0x11, 0x10])
         
         try? await Task.sleep(nanoseconds: 100_000_000)
         
-        // 2. Wake up MotionPlus
-        print("[*] Initializing MotionPlus extension (Step 1: 0x55 -> 0x04A600F0)...")
+        // Wake up MotionPlus Extension
+        print("[*] Initializing MotionPlus extension (Step 1)...")
         var init1 = [UInt8](repeating: 0, count: 22)
         init1[0] = 0x16; init1[1] = 0x04; init1[2] = 0xA6; init1[3] = 0x00; init1[4] = 0xF0; init1[5] = 0x01; init1[6] = 0x55
         sendWiimoteReport(data: init1)
         
         try? await Task.sleep(nanoseconds: 100_000_000)
         
-        print("[*] Initializing MotionPlus extension (Step 2: 0x04 -> 0x04A600FE)...")
+        print("[*] Initializing MotionPlus extension (Step 2)...")
         var init2 = [UInt8](repeating: 0, count: 22)
         init2[0] = 0x16; init2[1] = 0x04; init2[2] = 0xA6; init2[3] = 0x00; init2[4] = 0xFE; init2[5] = 0x01; init2[6] = 0x04
         sendWiimoteReport(data: init2)
         
         try? await Task.sleep(nanoseconds: 100_000_000)
         
-        print("[*] Setting Report Mode 0x35 (Buttons + Accelerometer + MotionPlus)...")
+        print("[*] Requesting Continuous Report Mode 0x35 (Buttons + Accelerometer + MotionPlus)...")
         sendWiimoteReport(data: [0x12, 0x00, 0x35])
         
         print("")
         print("🎮 ==================================================")
-        print("   PHYSICAL WIIMOTE IS NOW LIVE AS A USB GAMEPAD!     ")
+        print("   PHYSICAL WIIMOTE IS LIVE AS A USB GAMEPAD!         ")
         print("   1. Open https://gamepad-tester.com                ")
         print("   2. Move the Wiimote, tilt it, press buttons!       ")
         print("   3. Test Rumble on gamepad-tester.com to feel motor!")
@@ -160,7 +177,12 @@ func startWiimoteInitialization(device: IOHIDDevice) {
 }
 
 func wiimoteMatchCallback(context: UnsafeMutableRawPointer?, result: IOReturn, sender: UnsafeMutableRawPointer?, device: IOHIDDevice) {
-    print("[+] Linked to Physical Wii Remote!")
+    let transport = IOHIDDeviceGetProperty(device, kIOHIDTransportKey as CFString) as? String
+    if transport == "Virtual" {
+        return // Ignore our own virtual device!
+    }
+    
+    print("[+] Linked to Physical Bluetooth Wii Remote: \(device)")
     physicalWiimoteDevice = device
     
     let bufferSize = 64
@@ -170,96 +192,105 @@ func wiimoteMatchCallback(context: UnsafeMutableRawPointer?, result: IOReturn, s
     startWiimoteInitialization(device: device)
 }
 
+func setupVirtualDevice() async {
+    let descriptorBytes: [UInt8] = [
+        0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
+        0x09, 0x05,        // Usage (Game Pad)
+        0xA1, 0x01,        // Collection (Application)
+        0x85, 0x01,        //   Report ID (1)
+        
+        // --- 16 Buttons ---
+        0x05, 0x09,        //   Usage Page (Button)
+        0x19, 0x01,        //   Usage Minimum (Button 1)
+        0x29, 0x10,        //   Usage Maximum (Button 16)
+        0x15, 0x00,        //   Logical Minimum (0)
+        0x25, 0x01,        //   Logical Maximum (1)
+        0x75, 0x01,        //   Report Size (1 bit)
+        0x95, 0x10,        //   Report Count (16 buttons = 2 bytes)
+        0x81, 0x02,        //   Input (Data,Var,Abs)
+        
+        // --- Accelerometer: X, Y, Z (3 x 16-bit signed) ---
+        0x05, 0x01,        //   Usage Page (Generic Desktop Ctrls)
+        0x09, 0x30,        //   Usage (X)
+        0x09, 0x31,        //   Usage (Y)
+        0x09, 0x32,        //   Usage (Z)
+        0x16, 0x00, 0x80,  //   Logical Minimum (-32768)
+        0x26, 0xFF, 0x7F,  //   Logical Maximum (32767)
+        0x75, 0x10,        //   Report Size (16 bits)
+        0x95, 0x03,        //   Report Count (3)
+        0x81, 0x02,        //   Input (Data,Var,Abs)
+        
+        // --- Gyroscope: Rx, Ry, Rz (3 x 16-bit signed) ---
+        0x09, 0x33,        //   Usage (Rx - Pitch rate)
+        0x09, 0x34,        //   Usage (Ry - Roll rate)
+        0x09, 0x35,        //   Usage (Rz - Yaw rate)
+        0x16, 0x00, 0x80,  //   Logical Minimum (-32768)
+        0x26, 0xFF, 0x7F,  //   Logical Maximum (32767)
+        0x75, 0x10,        //   Report Size (16 bits)
+        0x95, 0x03,        //   Report Count (3)
+        0x81, 0x02,        //   Input (Data,Var,Abs)
+        
+        // --- Output Report for Rumble (1 byte) ---
+        0x85, 0x01,        //   Report ID (1)
+        0x05, 0x01,        //   Usage Page (Generic Desktop)
+        0x09, 0x00,        //   Usage (Undefined / Rumble)
+        0x15, 0x00,        //   Logical Minimum (0)
+        0x26, 0xFF, 0x00,  //   Logical Maximum (255)
+        0x75, 0x08,        //   Report Size (8 bits)
+        0x95, 0x01,        //   Report Count (1 byte)
+        0x91, 0x02,        //   Output (Data,Var,Abs)
+        
+        0xC0               // End Collection
+    ]
+    
+    let properties = HIDVirtualDevice.Properties(
+        descriptor: Data(descriptorBytes),
+        vendorID: 0x057E,
+        productID: 0x0307,
+        product: "Nintendo Wii Remote (USB Virtual)",
+        manufacturer: "Nintendo"
+    )
+    
+    guard let vDev = HIDVirtualDevice(properties: properties) else {
+        print("[-] Failed to create CoreHID virtual device.")
+        return
+    }
+    
+    virtualDevice = vDev
+    let vDelegate = VirtualGamepadDelegate()
+    await vDev.activate(delegate: vDelegate)
+    print("[+] Virtual USB Gamepad initialized in macOS kernel.")
+}
+
 @main
 struct MacWiimote {
-    static func main() async {
+    static func main() {
         print("==================================================")
         print("     Nintendo Wii Remote -> Virtual USB Gamepad   ")
         print("==================================================")
         
-        // 1. Create the Virtual USB HID Gamepad
-        let descriptorBytes: [UInt8] = [
-            0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
-            0x09, 0x05,        // Usage (Game Pad)
-            0xA1, 0x01,        // Collection (Application)
-            0x85, 0x01,        //   Report ID (1)
-            
-            // --- 16 Buttons ---
-            0x05, 0x09,        //   Usage Page (Button)
-            0x19, 0x01,        //   Usage Minimum (Button 1)
-            0x29, 0x10,        //   Usage Maximum (Button 16)
-            0x15, 0x00,        //   Logical Minimum (0)
-            0x25, 0x01,        //   Logical Maximum (1)
-            0x75, 0x01,        //   Report Size (1 bit)
-            0x95, 0x10,        //   Report Count (16 buttons = 2 bytes)
-            0x81, 0x02,        //   Input (Data,Var,Abs)
-            
-            // --- Accelerometer: X, Y, Z (3 x 16-bit signed) ---
-            0x05, 0x01,        //   Usage Page (Generic Desktop Ctrls)
-            0x09, 0x30,        //   Usage (X)
-            0x09, 0x31,        //   Usage (Y)
-            0x09, 0x32,        //   Usage (Z)
-            0x16, 0x00, 0x80,  //   Logical Minimum (-32768)
-            0x26, 0xFF, 0x7F,  //   Logical Maximum (32767)
-            0x75, 0x10,        //   Report Size (16 bits)
-            0x95, 0x03,        //   Report Count (3)
-            0x81, 0x02,        //   Input (Data,Var,Abs)
-            
-            // --- Gyroscope: Rx, Ry, Rz (3 x 16-bit signed) ---
-            0x09, 0x33,        //   Usage (Rx - Pitch rate)
-            0x09, 0x34,        //   Usage (Ry - Roll rate)
-            0x09, 0x35,        //   Usage (Rz - Yaw rate)
-            0x16, 0x00, 0x80,  //   Logical Minimum (-32768)
-            0x26, 0xFF, 0x7F,  //   Logical Maximum (32767)
-            0x75, 0x10,        //   Report Size (16 bits)
-            0x95, 0x03,        //   Report Count (3)
-            0x81, 0x02,        //   Input (Data,Var,Abs)
-            
-            // --- Output Report for Rumble (1 byte) ---
-            0x85, 0x01,        //   Report ID (1)
-            0x05, 0x01,        //   Usage Page (Generic Desktop)
-            0x09, 0x00,        //   Usage (Undefined / Rumble)
-            0x15, 0x00,        //   Logical Minimum (0)
-            0x26, 0xFF, 0x00,  //   Logical Maximum (255)
-            0x75, 0x08,        //   Report Size (8 bits)
-            0x95, 0x01,        //   Report Count (1 byte)
-            0x91, 0x02,        //   Output (Data,Var,Abs)
-            
-            0xC0               // End Collection
-        ]
-        
-        let properties = HIDVirtualDevice.Properties(
-            descriptor: Data(descriptorBytes),
-            vendorID: 0x057E,
-            productID: 0x0306,
-            product: "Nintendo Wii Remote (USB Virtual)",
-            manufacturer: "Nintendo"
-        )
-        
-        guard let vDev = HIDVirtualDevice(properties: properties) else {
-            print("[-] Failed to create CoreHID virtual device.")
-            return
+        // 1. Setup Virtual Device asynchronously
+        Task {
+            await setupVirtualDevice()
         }
         
-        virtualDevice = vDev
-        let vDelegate = VirtualGamepadDelegate()
-        await vDev.activate(delegate: vDelegate)
-        print("[+] Virtual USB Gamepad initialized in macOS kernel.")
-        
-        // 2. Set up IOHIDManager with dedicated Dispatch Queue
+        // 2. Setup IOHIDManager with RunLoop
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         let matching: [String: Any] = [
             kIOHIDVendorIDKey as String: 0x057E,
             kIOHIDProductIDKey as String: 0x0306
         ]
         IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
-        
-        let queue = DispatchQueue(label: "org.macwiimote.hid", qos: .userInteractive)
-        IOHIDManagerSetDispatchQueue(manager, queue)
+        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         
         let openStatus = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         guard openStatus == kIOReturnSuccess else {
-            print("[-] Failed to open IOHIDManager: \(String(format: "0x%08X", openStatus))")
+            if openStatus == kIOReturnExclusiveAccess {
+                print("[-] Error: Exclusive access conflict (kIOReturnExclusiveAccess).")
+                print("    Please completely quit Dolphin or wiimacmote (Cmd+Q) and try again.")
+            } else {
+                print("[-] Failed to open IOHIDManager: \(String(format: "0x%08X", UInt32(bitPattern: openStatus)))")
+            }
             return
         }
         
@@ -271,8 +302,7 @@ struct MacWiimote {
             }
         }
         
-        while true {
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-        }
+        // Pump Main RunLoop to process HID input reports
+        CFRunLoopRun()
     }
 }
