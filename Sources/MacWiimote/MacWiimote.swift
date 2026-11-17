@@ -8,35 +8,42 @@ nonisolated(unsafe) private var physicalWiimoteDevice: IOHIDDevice?
 nonisolated(unsafe) private var currentLEDMask: UInt8 = 0x10 // LED 1
 nonisolated(unsafe) private var virtualDevice: HIDVirtualDevice?
 
-// Wiimote Calibration & State
-nonisolated(unsafe) private var isCalibrated = false
-nonisolated(unsafe) private var calibrationSamples = 0
-nonisolated(unsafe) private var biasPitch: Double = 8192.0
-nonisolated(unsafe) private var biasRoll: Double = 8192.0
-nonisolated(unsafe) private var biasYaw: Double = 8192.0
+// =========================================================================
+// FIXED CALIBRATION CONSTANTS (DETERMINISTIC ACROSS ALL CONNECTIONS)
+// No dynamic re-calibration on connect: connecting at ANY angle yields
+// the exact same calibrated midpoints and scale every time.
+// =========================================================================
 
-nonisolated(unsafe) private var biasAccelX: Double = 512.0
-nonisolated(unsafe) private var biasAccelY: Double = 512.0
-nonisolated(unsafe) private var restingAccelZ: Double = 616.0
-nonisolated(unsafe) private var scale1G: Double = 104.0
+// Wiimote ADXL330 Accelerometer (10-bit: 0..1023)
+// Midpoint X & Y are 0G center (~500.0). Midpoint Z is resting flat buttons-up (+1G ~615.0).
+// Sensitivity is ~104.0 counts per 1G.
+private let fixedAccelMidpointX: Double = 500.0
+private let fixedAccelMidpointY: Double = 500.0
+private let fixedAccelMidpointZ: Double = 615.0
+private let fixedScale1G: Double = 104.0
 
-// Cached Gyroscope Values (MotionPlus)
+// MotionPlus Gyroscope (Nominal zero rate ~8192; cached as 0 when not active)
+private let fixedGyroBiasPitch: Double = 7890.0
+private let fixedGyroBiasRoll: Double = 8400.0
+private let fixedGyroBiasYaw: Double = 8145.0
+
+// Nunchuk Joystick & Accelerometer
+// Stick center is ~128.0 (deadzone ±6). Accel 0G center is ~512.0, resting Z (+1G) is ~720.0, scale is ~210.0.
+private let fixedNunchukCenterX: Double = 128.0
+private let fixedNunchukCenterY: Double = 128.0
+private let fixedNunchukAccelMidpointX: Double = 512.0
+private let fixedNunchukAccelMidpointY: Double = 512.0
+private let fixedNunchukAccelMidpointZ: Double = 720.0
+private let fixedNunchukScale1G: Double = 210.0
+
+// Cached Gyroscope Values
 nonisolated(unsafe) private var cachedGyroPitch: Int16 = 0
 nonisolated(unsafe) private var cachedGyroRoll: Int16 = 0
 nonisolated(unsafe) private var cachedGyroYaw: Int16 = 0
 
-// Nunchuk Hotplug & Calibration State
+// Nunchuk Hotplug & State
 nonisolated(unsafe) private var isNunchukConnected = false
 nonisolated(unsafe) private var isHandlingExtChange = false
-nonisolated(unsafe) private var nunchukCalibrated = false
-nonisolated(unsafe) private var nunchukCalibrationSamples = 0
-
-nonisolated(unsafe) private var nunchukCenterX: Double = 128.0
-nonisolated(unsafe) private var nunchukCenterY: Double = 128.0
-nonisolated(unsafe) private var nunchukAccelBiasX: Double = 512.0
-nonisolated(unsafe) private var nunchukAccelBiasY: Double = 512.0
-nonisolated(unsafe) private var nunchukAccelRestZ: Double = 740.0
-nonisolated(unsafe) private var nunchukScale1G: Double = 220.0
 
 nonisolated(unsafe) private var cachedNunchukStickX: Int16 = 0
 nonisolated(unsafe) private var cachedNunchukStickY: Int16 = 0
@@ -53,8 +60,11 @@ func sendWiimoteReport(data: [UInt8]) {
     guard let dev = physicalWiimoteDevice else { return }
     var payload = data
     let reportID = CFIndex(payload[0])
-    _ = payload.withUnsafeMutableBytes { ptr in
+    let ret = payload.withUnsafeMutableBytes { ptr in
         IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, reportID, ptr.baseAddress!, ptr.count)
+    }
+    if ret != kIOReturnSuccess {
+        print("[-] sendWiimoteReport(0x\(String(format: "%02X", payload[0]))) failed: 0x\(String(format: "%08X", UInt32(bitPattern: ret)))")
     }
 }
 
@@ -74,60 +84,49 @@ func setPhysicalWiimoteRumble(on: Bool) {
     sendWiimoteReport(data: [0x11, on ? (currentLEDMask | 0x01) : currentLEDMask])
 }
 
-// Hotplug Handler for Nunchuk Extension
+// Hotplug Handler for Nunchuk Extension via Hardware Report 0x20
 func handleExtensionStateChange(connected: Bool) {
     guard connected != isNunchukConnected else { return }
-    guard !isHandlingExtChange else { return }
-    isHandlingExtChange = true
     isNunchukConnected = connected
     
+    if !connected {
+        // Disconnected: immediately zero out cached Nunchuk inputs
+        cachedNunchukStickX = 0
+        cachedNunchukStickY = 0
+        cachedNunchukAccelX = 0
+        cachedNunchukAccelY = 0
+        cachedNunchukAccelZ = 0
+        cachedNunchukBtnC = false
+        cachedNunchukBtnZ = false
+        
+        print("")
+        print("🔌 ==================================================")
+        print("   NUNCHUK UNPLUGGED! Reverting to Wiimote Standalone")
+        print("====================================================")
+        sendWiimoteReport(data: [0x12, 0x04, 0x31])
+        return
+    }
+    
+    guard !isHandlingExtChange else { return }
+    isHandlingExtChange = true
+    
     Task {
-        if connected {
-            print("")
-            print("🔌 ==================================================")
-            print("   NUNCHUK DETECTED! Activating Pass-Through Mode... ")
-            print("====================================================")
-            
-            // Wake MotionPlus and set pass-through mode
-            writeWiimoteRegister(address: 0x04A600F0, value: 0x55)
-            try? await Task.sleep(nanoseconds: 60_000_000)
-            writeWiimoteRegister(address: 0x04A600FE, value: 0x05)
-            writeWiimoteRegister(address: 0x04A400FE, value: 0x05)
-            try? await Task.sleep(nanoseconds: 60_000_000)
-            
-            // Reset Nunchuk calibration
-            nunchukCalibrated = false
-            nunchukCalibrationSamples = 0
-            
-            // Request continuous reporting mode 0x35
-            sendWiimoteReport(data: [0x12, 0x00, 0x35])
-            print("[+] Nunchuk pass-through activated successfully!")
-        } else {
-            print("")
-            print("🔌 ==================================================")
-            print("   NUNCHUK UNPLUGGED! Restoring MotionPlus Standalone")
-            print("====================================================")
-            
-            // Reset cached Nunchuk inputs to neutral
-            cachedNunchukStickX = 0
-            cachedNunchukStickY = 0
-            cachedNunchukAccelX = 0
-            cachedNunchukAccelY = 0
-            cachedNunchukAccelZ = 0
-            cachedNunchukBtnC = false
-            cachedNunchukBtnZ = false
-            
-            // Restore MotionPlus standalone mode
-            writeWiimoteRegister(address: 0x04A600F0, value: 0x55)
-            try? await Task.sleep(nanoseconds: 60_000_000)
-            writeWiimoteRegister(address: 0x04A600FE, value: 0x04)
-            writeWiimoteRegister(address: 0x04A400FE, value: 0x04)
-            try? await Task.sleep(nanoseconds: 60_000_000)
-            
-            // Request continuous reporting mode 0x35
-            sendWiimoteReport(data: [0x12, 0x00, 0x35])
-            print("[+] Standalone MotionPlus restored.")
-        }
+        print("")
+        print("🔌 ==================================================")
+        print("   NUNCHUK DETECTED! Initializing extension...      ")
+        print("====================================================")
+        
+        // Step 1: Disable encryption ("The New Way")
+        writeWiimoteRegister(address: 0xA400F0, value: 0x55)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        
+        // Step 2: Complete initialization
+        writeWiimoteRegister(address: 0xA400FB, value: 0x00)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        
+        // Step 3: Request Continuous Reporting Mode 0x35 (Buttons + Accel + Extension)
+        sendWiimoteReport(data: [0x12, 0x04, 0x35])
+        print("[+] Nunchuk initialized successfully (Mode 0x35 active).")
         
         isHandlingExtChange = false
     }
@@ -155,226 +154,149 @@ func wiimoteInputCallback(context: UnsafeMutableRawPointer?, result: IOReturn, s
     let data = Data(bytes: report, count: reportLength)
     let id = data[0]
     
-    // Status Report 0x20: Sent automatically when extensions are plugged/unplugged
+    // -----------------------------------------------------------------
+    // Status Report 0x20: Authoritative Hardware Notification
+    // Automatically sent by Wiimote whenever an extension is plugged or unplugged
+    // -----------------------------------------------------------------
     if id == 0x20 && data.count >= 4 {
-        let extConnected = (data[3] & 0x02) != 0
-        handleExtensionStateChange(connected: extConnected)
+        let hasExtension = (data[3] & 0x02) != 0
+        handleExtensionStateChange(connected: hasExtension)
+        // Wiibrew specification: Unsolicited 0x20 requires 0x12 to re-affirm continuous mode
+        sendWiimoteReport(data: [0x12, 0x04, hasExtension ? 0x35 : 0x31])
+        return
+    }
+    
+    // Process Data Reporting Modes: 0x31 (Buttons + Accel) or 0x35 (Buttons + Accel + Extension)
+    guard (id == 0x31 && data.count >= 6) || (id == 0x35 && data.count >= 12) else {
         return
     }
     
     packetCount += 1
     
-    if id == 0x35 && data.count >= 22 {
-        let b1 = data[1]
-        let b2 = data[2]
-        
-        // Parse Digital Buttons (Core Wiimote)
-        var buttons: UInt16 = 0
-        if (b2 & 0x08) != 0 { buttons |= (1 << 0) } // Btn 1: A
-        if (b2 & 0x04) != 0 { buttons |= (1 << 1) } // Btn 2: B
-        if (b2 & 0x02) != 0 { buttons |= (1 << 2) } // Btn 3: 1
-        if (b2 & 0x01) != 0 { buttons |= (1 << 3) } // Btn 4: 2
-        if (b2 & 0x10) != 0 { buttons |= (1 << 4) } // Btn 5: Minus
-        if (b1 & 0x10) != 0 { buttons |= (1 << 5) } // Btn 6: Plus
-        if (b2 & 0x80) != 0 { buttons |= (1 << 6) } // Btn 7: Home
-        if (b1 & 0x08) != 0 { buttons |= (1 << 7) } // Btn 8: D-Pad Up
-        if (b1 & 0x04) != 0 { buttons |= (1 << 8) } // Btn 9: D-Pad Down
-        if (b1 & 0x01) != 0 { buttons |= (1 << 9) } // Btn 10: D-Pad Left
-        if (b1 & 0x02) != 0 { buttons |= (1 << 10) }// Btn 11: D-Pad Right
-        
-        // Re-calibrate zero pose if Home button is pressed while already calibrated
-        if (b2 & 0x80) != 0 && isCalibrated {
-            print("[*] Home button pressed -> Re-calibrating zero pose (keep Wiimote still on desk)...")
-            isCalibrated = false
-            calibrationSamples = 0
-            nunchukCalibrated = false
-            nunchukCalibrationSamples = 0
-        }
-        
-        // Accelerometer 10-bit reconstruction (0..1023, center ~512)
-        let rawX10 = (Int(data[3]) << 2) | ((Int(b1) >> 5) & 0x03)
-        let rawY10 = (Int(data[4]) << 2) | ((Int(b2) >> 4) & 0x02)
-        let rawZ10 = (Int(data[5]) << 2) | ((Int(b2) >> 5) & 0x02)
-        
-        // Wiimote Calibration for first 60 frames while resting flat, buttons up
-        if !isCalibrated {
-            calibrationSamples += 1
-            if calibrationSamples == 1 {
-                biasAccelX = Double(rawX10)
-                biasAccelY = Double(rawY10)
-                restingAccelZ = Double(rawZ10)
-            } else {
-                biasAccelX += (Double(rawX10) - biasAccelX) * 0.08
-                biasAccelY += (Double(rawY10) - biasAccelY) * 0.08
-                restingAccelZ += (Double(rawZ10) - restingAccelZ) * 0.08
-            }
-            
-            if calibrationSamples >= 60 {
-                isCalibrated = true
-                scale1G = max(restingAccelZ - 512.0, 80.0)
-                print(String(format: "[+] Calibration complete! Resting pose locked."))
-                print(String(format: "    Wiimote Accel bias: X=%.1f, Y=%.1f | Rest Z (+1G): %.1f | Scale1G: %.1f counts/G", biasAccelX, biasAccelY, restingAccelZ, scale1G))
-                print(String(format: "    Wiimote Gyro bias: Pitch=%.1f, Roll=%.1f, Yaw=%.1f", biasPitch, biasRoll, biasYaw))
-                print("[*] Tip: You can press the 'Home' button anytime while resting flat to re-zero!")
-            }
-        }
-        
-        // Scaled Wiimote Accelerometer (-32768 to 32767)
-        let diffX = Double(rawX10) - biasAccelX
-        let diffY = Double(rawY10) - biasAccelY
-        let diffZ = Double(rawZ10) - restingAccelZ
-        let accelX = Int16(clamping: Int((diffX / scale1G) * 32767.0))
-        let accelY = Int16(clamping: Int((diffY / scale1G) * 32767.0))
-        let accelZ = Int16(clamping: Int((diffZ / scale1G) * 32767.0))
-        
-        // Process Extension Payload (Bytes 6..21)
-        // Bit 1 of Byte 5 (data[11]) determines packet type in pass-through mode:
-        // 1 = MotionPlus Gyro, 0 = Nunchuk Extension
-        let isMPPacket = (data[11] & 0x02) != 0
-        
-        if isMPPacket {
-            // MotionPlus Packet: 14-bit angular rates
-            let yawLow = Int(data[6])
-            let rollLow = Int(data[7])
-            let pitchLow = Int(data[8])
-            let yawHigh = (Int(data[9]) >> 2) & 0x3F
-            let rollHigh = (Int(data[10]) >> 2) & 0x3F
-            let pitchHigh = (Int(data[11]) >> 2) & 0x3F
-            
-            let rawYaw = Double((yawHigh << 8) | yawLow)
-            let rawRoll = Double((rollHigh << 8) | rollLow)
-            let rawPitch = Double((pitchHigh << 8) | pitchLow)
-            
-            if !isCalibrated {
-                biasPitch += (rawPitch - biasPitch) * 0.08
-                biasRoll  += (rawRoll  - biasRoll)  * 0.08
-                biasYaw   += (rawYaw   - biasYaw)   * 0.08
-            }
-            
-            cachedGyroPitch = Int16(clamping: Int((rawPitch - biasPitch) * 24.0))
-            cachedGyroRoll  = Int16(clamping: Int((rawRoll  - biasRoll)  * 24.0))
-            cachedGyroYaw   = Int16(clamping: Int((rawYaw   - biasYaw)   * 24.0))
-            
-            // Check hardware Extension Connected bit in Byte 4 Bit 0
-            let extConnectedBit = (data[10] & 0x01) != 0
-            if extConnectedBit != isNunchukConnected {
-                handleExtensionStateChange(connected: extConnectedBit)
-            }
-        } else {
-            // Nunchuk Pass-Through Packet
-            if !isNunchukConnected {
-                isNunchukConnected = true
-            }
-            
+    let b1 = data[1]
+    let b2 = data[2]
+    
+    // Parse Digital Buttons (Core Wiimote)
+    var buttons: UInt16 = 0
+    if (b2 & 0x08) != 0 { buttons |= (1 << 0) } // Btn 1: A
+    if (b2 & 0x04) != 0 { buttons |= (1 << 1) } // Btn 2: B
+    if (b2 & 0x02) != 0 { buttons |= (1 << 2) } // Btn 3: 1
+    if (b2 & 0x01) != 0 { buttons |= (1 << 3) } // Btn 4: 2
+    if (b2 & 0x10) != 0 { buttons |= (1 << 4) } // Btn 5: Minus
+    if (b1 & 0x10) != 0 { buttons |= (1 << 5) } // Btn 6: Plus
+    if (b2 & 0x80) != 0 { buttons |= (1 << 6) } // Btn 7: Home
+    if (b1 & 0x08) != 0 { buttons |= (1 << 7) } // Btn 8: D-Pad Up
+    if (b1 & 0x04) != 0 { buttons |= (1 << 8) } // Btn 9: D-Pad Down
+    if (b1 & 0x01) != 0 { buttons |= (1 << 9) } // Btn 10: D-Pad Left
+    if (b1 & 0x02) != 0 { buttons |= (1 << 10) }// Btn 11: D-Pad Right
+    
+    // Accelerometer 10-bit reconstruction (0..1023)
+    let rawX10 = (Int(data[3]) << 2) | ((Int(b1) >> 5) & 0x03)
+    let rawY10 = (Int(data[4]) << 2) | ((Int(b2) >> 4) & 0x02)
+    let rawZ10 = (Int(data[5]) << 2) | ((Int(b2) >> 5) & 0x02)
+    
+    // Scaled Wiimote Accelerometer using FIXED deterministic midpoints
+    let diffX = Double(rawX10) - fixedAccelMidpointX
+    let diffY = Double(rawY10) - fixedAccelMidpointY
+    let diffZ = Double(rawZ10) - fixedAccelMidpointZ
+    let accelX = Int16(clamping: Int((diffX / fixedScale1G) * 32767.0))
+    let accelY = Int16(clamping: Int((diffY / fixedScale1G) * 32767.0))
+    let accelZ = Int16(clamping: Int((diffZ / fixedScale1G) * 32767.0))
+    
+    // Process Nunchuk Extension Payload if connected and reporting in Mode 0x35
+    if isNunchukConnected && id == 0x35 && data.count >= 12 {
+        // Sanity-check: ignore open-bus noise (0xFF floating lines)
+        let isOpenBus = (data[6] == 0xFF && data[7] == 0xFF && data[8] == 0xFF && data[9] == 0xFF)
+        if !isOpenBus {
             let rawSX = Double(data[6])
             let rawSY = Double(data[7])
-            
             let b5 = data[11]
-            let rawNx10 = (Int(data[8]) << 2) | ((Int(b5) >> 3) & 0x02)
-            let rawNy10 = (Int(data[9]) << 2) | ((Int(b5) >> 4) & 0x02)
-            let rawNz10 = (Int(data[10]) << 2) | ((Int(b5) >> 5) & 0x02)
             
-            // Nunchuk Buttons in pass-through mode:
-            // Bit 3 = Button C, Bit 2 = Button Z (Active Low: 0 = pressed)
-            cachedNunchukBtnC = (b5 & 0x08) == 0
-            cachedNunchukBtnZ = (b5 & 0x04) == 0
+            // Nunchuk Buttons: Active Low (0 = pressed, 1 = released)
+            // Bit 1 = Button C, Bit 0 = Button Z
+            cachedNunchukBtnC = (b5 & 0x02) == 0
+            cachedNunchukBtnZ = (b5 & 0x01) == 0
             
-            // Auto-center Nunchuk analog stick & zero accelerometer
-            if !nunchukCalibrated {
-                nunchukCalibrationSamples += 1
-                if nunchukCalibrationSamples == 1 {
-                    nunchukCenterX = rawSX
-                    nunchukCenterY = rawSY
-                    nunchukAccelBiasX = Double(rawNx10)
-                    nunchukAccelBiasY = Double(rawNy10)
-                    nunchukAccelRestZ = Double(rawNz10)
-                } else {
-                    nunchukCenterX += (rawSX - nunchukCenterX) * 0.1
-                    nunchukCenterY += (rawSY - nunchukCenterY) * 0.1
-                    nunchukAccelBiasX += (Double(rawNx10) - nunchukAccelBiasX) * 0.1
-                    nunchukAccelBiasY += (Double(rawNy10) - nunchukAccelBiasY) * 0.1
-                    nunchukAccelRestZ += (Double(rawNz10) - nunchukAccelRestZ) * 0.1
-                }
-                
-                if nunchukCalibrationSamples >= 30 {
-                    nunchukCalibrated = true
-                    nunchukScale1G = max(nunchukAccelRestZ - 512.0, 100.0)
-                    print(String(format: "[+] Nunchuk zero-calibration complete! Center: (%.1f, %.1f) | Rest Z: %.1f", nunchukCenterX, nunchukCenterY, nunchukAccelRestZ))
-                }
-            }
-            
-            // Scaled Nunchuk Stick: -32768 to 32767
-            let diffSX = rawSX - nunchukCenterX
-            let diffSY = rawSY - nunchukCenterY
+            // Scaled Nunchuk Stick: -32768 to 32767 (with ±6 deadzone)
+            var diffSX = rawSX - fixedNunchukCenterX
+            var diffSY = rawSY - fixedNunchukCenterY
+            if abs(diffSX) < 6.0 { diffSX = 0.0 }
+            if abs(diffSY) < 6.0 { diffSY = 0.0 }
             cachedNunchukStickX = Int16(clamping: Int((diffSX / 80.0) * 32767.0))
             cachedNunchukStickY = Int16(clamping: Int((-diffSY / 80.0) * 32767.0))
             
-            // Scaled Nunchuk Accelerometer: -32768 to 32767
-            let diffNx = Double(rawNx10) - nunchukAccelBiasX
-            let diffNy = Double(rawNy10) - nunchukAccelBiasY
-            let diffNz = Double(rawNz10) - nunchukAccelRestZ
-            cachedNunchukAccelX = Int16(clamping: Int((diffNx / nunchukScale1G) * 32767.0))
-            cachedNunchukAccelY = Int16(clamping: Int((diffNy / nunchukScale1G) * 32767.0))
-            cachedNunchukAccelZ = Int16(clamping: Int((diffNz / nunchukScale1G) * 32767.0))
-        }
-        
-        // Assemble Virtual USB Gamepad report
-        var buttonsOut = buttons
-        if cachedNunchukBtnC { buttonsOut |= (1 << 11) } // Button 12: Nunchuk C
-        if cachedNunchukBtnZ { buttonsOut |= (1 << 12) } // Button 13: Nunchuk Z
-        
-        // Primary stick axes: Nunchuk joystick if connected, otherwise Wiimote tilt steering fallback
-        let axis0 = isNunchukConnected ? cachedNunchukStickX : accelX
-        let axis1 = isNunchukConnected ? cachedNunchukStickY : accelY
-        
-        var virtualReport = Data([0x01]) // Report ID 1
-        withUnsafeBytes(of: buttonsOut.littleEndian) { virtualReport.append(contentsOf: $0) }
-        withUnsafeBytes(of: axis0.littleEndian) { virtualReport.append(contentsOf: $0) }
-        withUnsafeBytes(of: axis1.littleEndian) { virtualReport.append(contentsOf: $0) }
-        withUnsafeBytes(of: accelX.littleEndian) { virtualReport.append(contentsOf: $0) }
-        withUnsafeBytes(of: accelY.littleEndian) { virtualReport.append(contentsOf: $0) }
-        withUnsafeBytes(of: accelZ.littleEndian) { virtualReport.append(contentsOf: $0) }
-        withUnsafeBytes(of: cachedGyroPitch.littleEndian) { virtualReport.append(contentsOf: $0) }
-        withUnsafeBytes(of: cachedGyroRoll.littleEndian) { virtualReport.append(contentsOf: $0) }
-        withUnsafeBytes(of: cachedGyroYaw.littleEndian) { virtualReport.append(contentsOf: $0) }
-        withUnsafeBytes(of: cachedNunchukAccelX.littleEndian) { virtualReport.append(contentsOf: $0) }
-        withUnsafeBytes(of: cachedNunchukAccelY.littleEndian) { virtualReport.append(contentsOf: $0) }
-        withUnsafeBytes(of: cachedNunchukAccelZ.littleEndian) { virtualReport.append(contentsOf: $0) }
-        
-        if let dev = virtualDevice {
-            Task {
-                try? await dev.dispatchInputReport(data: virtualReport, timestamp: .now)
-            }
-        }
-        
-        if packetCount % 50 == 0 || buttonsOut != 0 {
-            var pressed = [String]()
-            if (b2 & 0x08) != 0 { pressed.append("A") }
-            if (b2 & 0x04) != 0 { pressed.append("B") }
-            if (b2 & 0x02) != 0 { pressed.append("1") }
-            if (b2 & 0x01) != 0 { pressed.append("2") }
-            if (b2 & 0x10) != 0 { pressed.append("-") }
-            if (b1 & 0x10) != 0 { pressed.append("+") }
-            if (b2 & 0x80) != 0 { pressed.append("Home") }
-            if (b1 & 0x08) != 0 { pressed.append("Up") }
-            if (b1 & 0x04) != 0 { pressed.append("Down") }
-            if (b1 & 0x01) != 0 { pressed.append("Left") }
-            if (b1 & 0x02) != 0 { pressed.append("Right") }
-            if cachedNunchukBtnC { pressed.append("C") }
-            if cachedNunchukBtnZ { pressed.append("Z") }
-            let btnStr = pressed.isEmpty ? "[None]" : pressed.joined(separator: "+")
+            // Scaled Nunchuk Accelerometer: 10-bit reconstruction
+            // Upper 8 bits in data[8..10], lower 2 bits in b5
+            // AX<1:0> in bits 3..2, AY<1:0> in bits 5..4, AZ<1:0> in bits 7..6
+            let rawNx10 = (Int(data[8]) << 2) | Int((b5 >> 2) & 0x03)
+            let rawNy10 = (Int(data[9]) << 2) | Int((b5 >> 4) & 0x03)
+            let rawNz10 = (Int(data[10]) << 2) | Int((b5 >> 6) & 0x03)
             
-            if isNunchukConnected {
-                print(String(format: "🎮 Telemetry | Buttons: %@ | Nunchuk Stick: X=%6d Y=%6d | Wiimote Accel: X=%6d Y=%6d | Nunchuk Accel: X=%6d Y=%6d",
-                             btnStr.padding(toLength: 12, withPad: " ", startingAt: 0),
-                             cachedNunchukStickX, cachedNunchukStickY,
-                             accelX, accelY,
-                             cachedNunchukAccelX, cachedNunchukAccelY))
-            } else {
-                print(String(format: "🎮 Telemetry | Buttons: %@ | Wiimote Accel: X=%6d Y=%6d Z=%6d | Gyro: P=%6d R=%6d Y=%6d",
-                             btnStr.padding(toLength: 12, withPad: " ", startingAt: 0),
-                             accelX, accelY, accelZ, cachedGyroPitch, cachedGyroRoll, cachedGyroYaw))
-            }
+            let diffNx = Double(rawNx10) - fixedNunchukAccelMidpointX
+            let diffNy = Double(rawNy10) - fixedNunchukAccelMidpointY
+            let diffNz = Double(rawNz10) - fixedNunchukAccelMidpointZ
+            cachedNunchukAccelX = Int16(clamping: Int((diffNx / fixedNunchukScale1G) * 32767.0))
+            cachedNunchukAccelY = Int16(clamping: Int((diffNy / fixedNunchukScale1G) * 32767.0))
+            cachedNunchukAccelZ = Int16(clamping: Int((diffNz / fixedNunchukScale1G) * 32767.0))
+        }
+    }
+    
+    // Assemble Virtual USB Gamepad report
+    var buttonsOut = buttons
+    if cachedNunchukBtnC { buttonsOut |= (1 << 11) } // Button 12: Nunchuk C
+    if cachedNunchukBtnZ { buttonsOut |= (1 << 12) } // Button 13: Nunchuk Z
+    
+    // Primary stick axes: Nunchuk joystick if connected, otherwise Wiimote tilt steering fallback
+    let axis0 = isNunchukConnected ? cachedNunchukStickX : accelX
+    let axis1 = isNunchukConnected ? cachedNunchukStickY : accelY
+    
+    var virtualReport = Data([0x01]) // Report ID 1
+    withUnsafeBytes(of: buttonsOut.littleEndian) { virtualReport.append(contentsOf: $0) }
+    withUnsafeBytes(of: axis0.littleEndian) { virtualReport.append(contentsOf: $0) }
+    withUnsafeBytes(of: axis1.littleEndian) { virtualReport.append(contentsOf: $0) }
+    withUnsafeBytes(of: accelX.littleEndian) { virtualReport.append(contentsOf: $0) }
+    withUnsafeBytes(of: accelY.littleEndian) { virtualReport.append(contentsOf: $0) }
+    withUnsafeBytes(of: accelZ.littleEndian) { virtualReport.append(contentsOf: $0) }
+    withUnsafeBytes(of: cachedGyroPitch.littleEndian) { virtualReport.append(contentsOf: $0) }
+    withUnsafeBytes(of: cachedGyroRoll.littleEndian) { virtualReport.append(contentsOf: $0) }
+    withUnsafeBytes(of: cachedGyroYaw.littleEndian) { virtualReport.append(contentsOf: $0) }
+    withUnsafeBytes(of: cachedNunchukAccelX.littleEndian) { virtualReport.append(contentsOf: $0) }
+    withUnsafeBytes(of: cachedNunchukAccelY.littleEndian) { virtualReport.append(contentsOf: $0) }
+    withUnsafeBytes(of: cachedNunchukAccelZ.littleEndian) { virtualReport.append(contentsOf: $0) }
+    
+    if let dev = virtualDevice {
+        Task {
+            try? await dev.dispatchInputReport(data: virtualReport, timestamp: .now)
+        }
+    }
+    
+    if packetCount % 50 == 0 || buttonsOut != 0 {
+        var pressed = [String]()
+        if (b2 & 0x08) != 0 { pressed.append("A") }
+        if (b2 & 0x04) != 0 { pressed.append("B") }
+        if (b2 & 0x02) != 0 { pressed.append("1") }
+        if (b2 & 0x01) != 0 { pressed.append("2") }
+        if (b2 & 0x10) != 0 { pressed.append("-") }
+        if (b1 & 0x10) != 0 { pressed.append("+") }
+        if (b2 & 0x80) != 0 { pressed.append("Home") }
+        if (b1 & 0x08) != 0 { pressed.append("Up") }
+        if (b1 & 0x04) != 0 { pressed.append("Down") }
+        if (b1 & 0x01) != 0 { pressed.append("Left") }
+        if (b1 & 0x02) != 0 { pressed.append("Right") }
+        if cachedNunchukBtnC { pressed.append("C") }
+        if cachedNunchukBtnZ { pressed.append("Z") }
+        let btnStr = pressed.isEmpty ? "[None]" : pressed.joined(separator: "+")
+        
+        if isNunchukConnected {
+            print(String(format: "🎮 Telemetry [NUNCHUK] | Btns: %@ | Stick: X=%6d Y=%6d | Wiimote Accel: X=%6d Y=%6d | Nunchuk Accel: X=%6d Y=%6d Z=%6d",
+                         btnStr.padding(toLength: 12, withPad: " ", startingAt: 0),
+                         cachedNunchukStickX, cachedNunchukStickY,
+                         accelX, accelY,
+                         cachedNunchukAccelX, cachedNunchukAccelY, cachedNunchukAccelZ))
+        } else {
+            print(String(format: "🎮 Telemetry [WIIMOTE] | Btns: %@ | Accel: X=%6d Y=%6d Z=%6d",
+                         btnStr.padding(toLength: 12, withPad: " ", startingAt: 0),
+                         accelX, accelY, accelZ))
         }
     }
 }
@@ -386,43 +308,25 @@ func startWiimoteInitialization(device: IOHIDDevice) {
         sendWiimoteReport(data: [0x11, 0x10])
         try? await Task.sleep(nanoseconds: 100_000_000)
         
-        // 2. Query Wiimote status to detect attached extensions
-        print("[*] Querying extension status...")
+        // 2. Query Status (Report 0x15) to detect if an extension is already attached
+        print("[*] Querying Wiimote hardware status (Report 0x15)...")
         sendWiimoteReport(data: [0x15, 0x00])
         try? await Task.sleep(nanoseconds: 150_000_000)
         
-        // 3. Wake up MotionPlus Extension (Step 1: 0x55 -> 0xA600F0)
-        print("[*] Initializing MotionPlus extension (Step 1: 0x55 -> 0xA600F0)...")
-        writeWiimoteRegister(address: 0x04A600F0, value: 0x55)
-        try? await Task.sleep(nanoseconds: 100_000_000)
-        
-        // 4. Activate MotionPlus mode based on whether extension is detected
-        if isNunchukConnected {
-            print("[*] Initializing MotionPlus in NUNCHUK PASS-THROUGH mode (Step 2: 0x05 -> 0xA600FE)...")
-            writeWiimoteRegister(address: 0x04A600FE, value: 0x05)
-            writeWiimoteRegister(address: 0x04A400FE, value: 0x05)
-            try? await Task.sleep(nanoseconds: 100_000_000)
-        } else {
-            print("[*] Initializing MotionPlus in STANDALONE mode (Step 2: 0x04 -> 0xA600FE)...")
-            writeWiimoteRegister(address: 0x04A600FE, value: 0x04)
-            writeWiimoteRegister(address: 0x04A400FE, value: 0x04)
-            try? await Task.sleep(nanoseconds: 100_000_000)
+        // 3. Fallback: If no extension was detected from status query, start standalone mode 0x31
+        if !isNunchukConnected {
+            print("[*] No extension detected at startup. Starting Standalone Mode 0x31...")
+            sendWiimoteReport(data: [0x12, 0x04, 0x31])
         }
-        
-        // 5. Request Continuous Report Mode 0x35 (Buttons + Accelerometer + Extension)
-        print("[*] Requesting Continuous Report Mode 0x35 (Buttons + Accelerometer + Extension)...")
-        sendWiimoteReport(data: [0x12, 0x00, 0x35])
         
         print("")
         print("🎮 ==================================================")
-        print("   PHYSICAL WIIMOTE + NUNCHUK IS LIVE AS A USB GAMEPAD!")
-        print("   - Wiimote Tilt: Accel X/Y/Z                       ")
-        print("   - Wiimote Gyro: Pitch/Roll/Yaw (MotionPlus)       ")
-        print("   - Nunchuk: Analog Stick, Buttons C & Z, Tilt Accel")
-        print("   - Hotplug: Plug/unplug Nunchuk dynamically anytime")
+        print("   PHYSICAL WIIMOTE IS LIVE AS A USB GAMEPAD!        ")
+        print("   - Calibration: FIXED DETERMINISTIC MIDPOINTS ACTIVE")
+        print("   - Wiimote Tilt: Accel X/Y/Z (Fixed midpoints)     ")
+        print("   - Nunchuk: Dynamic hardware hotplug active (0x20) ")
         print("   - 1. Open https://gamepad-tester.com              ")
-        print("   - 2. Move Nunchuk stick, press C & Z!             ")
-        print("   - 3. Test Rumble on gamepad-tester.com!           ")
+        print("   - 2. Connect / disconnect Nunchuk to test!        ")
         print("====================================================")
     }
 }
@@ -519,6 +423,13 @@ struct MacWiimote {
     static func main() {
         print("==================================================")
         print("     Nintendo Wii Remote -> Virtual USB Gamepad   ")
+        print("==================================================")
+        print("[+] Fixed Deterministic Midpoints Loaded:")
+        print("    - Wiimote Accel: Midpoint (X=\(fixedAccelMidpointX), Y=\(fixedAccelMidpointY), Z=\(fixedAccelMidpointZ)) | Scale: \(fixedScale1G)")
+        print("    - Nunchuk Stick: Center (X=\(fixedNunchukCenterX), Y=\(fixedNunchukCenterY))")
+        print("    - Nunchuk Accel: Midpoint (X=\(fixedNunchukAccelMidpointX), Y=\(fixedNunchukAccelMidpointY), Z=\(fixedNunchukAccelMidpointZ)) | Scale: \(fixedNunchukScale1G)")
+        print("[*] Connection at ANY angle will use these exact midpoints.")
+        print("[*] Extension Hotplug: Listening for hardware Report 0x20")
         print("==================================================")
         
         // 1. Setup Virtual Device asynchronously
